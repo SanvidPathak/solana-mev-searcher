@@ -5,18 +5,31 @@ A low-latency, cross-DEX **backrun-arbitrage** searcher for Solana — built and
 ## What it does
 Maintains a real-time price graph across **Raydium AMM v4, Orca Whirlpool, Pump / PumpSwap and Meteora DLMM**, detects the transient cross-DEX dislocations that user swaps create, and submits **revert-protected backruns** to arbitrage them. Also runs **liquidation detection** (Kamino klend + Scope, MarginFi), record-only.
 
-## Engineering
-- **Rust workspace** — core · DEX plugins · detection · executor · safety — with zero-copy on-chain decoders and **exact CLMM/DLMM quoters** (full swap-curve math, not x·y=k approximations).
-- **Flashloan-funded** (Kamino, MarginFi); **legacy / v0 + ALT / v1 (SIMD-0385)** transactions with self-managed address-lookup tables.
-- **Frankfurt co-location**; gRPC (LaserStream / Yellowstone) ingest; leader- and builder-aware landing.
+## On-chain correctness
+- **Exact CLMM/DLMM quoters** — full ports of the Orca Whirlpool and Meteora DLMM swap loops (tick- and bin-array traversal, adaptive/variable fees, oracle-aware), equal to the programs' *own* on-chain output on real mainnet pools (verified against `orca-whirlpools-core` and the DLMM SDK).
+- A leg that cannot be quoted exactly is **dropped, never approximated** — no x·y=k fallback on pools with plugins. This is how phantom profit is engineered out.
+- Zero-copy, `bytemuck`-Pod decoders; byte layouts pinned to canonical IDLs and cross-checked against real mainnet account dumps and a golden-fixture corpus.
 
-## Execution & safety
-A complete execution pipeline, exercised live on Solana mainnet: **detection → route verification → build → simulation → bundle submission → on-chain landing confirmation → realized-P&L accounting → loss limits.**
-- **Jito-compatible and Jito-whitelisted** — multi-region bundle submission; plugs into Jito-protocol-compatible searcher networks by endpoint change.
-- Atomic, **revert-dropping** bundles guarded by an on-chain profit check.
-- **Kill switch, circuit breakers, and hourly / daily / lifetime P&L loss limits** in production.
+## Low-latency architecture
+- **Lock-free hot path** — a sharded concurrent price graph with `Arc`-swap state updates, strict per-account ordering, bounded back-pressured channels, a single sequential update consumer feeding a work-stealing opportunity dispatcher. No allocation or locking on the critical path.
+- Keyed, content-hashed deduplication at **~18.6 ns per update** (benchmarked), so the ingest firehose never stalls detection.
+- **Tiered detection** — O(1) pair-scan on the changed pair, plus a periodic Bellman-Ford negative-cycle search run off-thread, with per-scan memoization and a provably-sound pruning pass.
+- **Frankfurt co-location** (~1–2 ms to regional Jito/Helius endpoints), warm connection pooling, and leader- and slot-boundary-aware send timing.
+- Every pipeline stage is instrumented with **p50 / p90 / p99 latency percentiles**.
 
-## Discipline
-Deterministic **capture-and-replay** testing and a **record-only, measurement-gated** rollout — nothing goes live until a pre-registered measurement passes. The focus throughout is on-chain decode/quote correctness, latency, and rigorous measurement before any capital is risked.
+## Transactions & execution
+- **Legacy / v0 + ALT / hand-encoded v1 (SIMD-0385)** transactions, golden-tested byte-for-byte against real mainnet v1 transactions; self-managed address-lookup tables; a unique-key account-budget bound computed before every build.
+- **Flashloan-funded** (Kamino, MarginFi) with exact on-chain fee accounting, proven by mainnet simulation.
+- Compute-unit limits sized from live simulation — cached, shape-learned, or modeled; **atomic, revert-dropping bundles** guarded by an on-chain profit check.
+
+## Robustness & safety
+- **Fail-closed everywhere** — landing confirmed by on-chain signature; submission pauses if the chain can't be read; stream-lag and data-freshness gates; automatic stream reconnection with targeted repair reads; a quota governor that throttles cost but never starves discovery.
+- **Production safety rails** — per-DEX and global circuit breakers, a kill switch, and persisted hourly / daily / lifetime realized-P&L loss limits restored across restarts.
+- Secrets never reach logs, captures, or error text (centralized redaction); overflow-checked arithmetic; typed, classified error handling.
+
+## Engineering discipline
+- **Deterministic capture-and-replay** — the production pipeline replays a recorded mainnet stream *byte-identically per build*, so every change is A/B-verifiable offline against real data.
+- Shred-level decoding with **Reed-Solomon (FEC) reconstruction** and kernel-timestamped arrival analysis for latency measurement.
+- A **record-only, pre-registered-measurement** rollout — nothing goes live until a frozen, pre-registered metric passes. Correctness and measurement before capital.
 
 _Source is private; a scoped technical walkthrough is available to partners under NDA._
