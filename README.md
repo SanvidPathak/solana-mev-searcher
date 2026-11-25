@@ -95,7 +95,7 @@ flowchart TB
 ```
 
 > **Primary route: orderflow-auction (OFA)** — a backrun submitted as a bid, where position
-> is won in the auction rather than the 26–67 ms open-market speed race. Shred-reactive
+> is won in the auction rather than the open-market speed race. Shred-reactive
 > racing is kept as the fallback. The engine is built around the OFA route.
 
 ## On-chain correctness
