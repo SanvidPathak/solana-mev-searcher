@@ -5,6 +5,7 @@
 ![Routing](https://img.shields.io/badge/routing-OFA--first-0ca678)
 ![Strategy](https://img.shields.io/badge/backrun--only-no%20sandwiching-blue)
 ![Status](https://img.shields.io/badge/status-research-lightgrey)
+[![LinkedIn](https://img.shields.io/badge/LinkedIn-project%20write--up-0A66C2?logo=linkedin&logoColor=white)](https://www.linkedin.com/feed/update/urn:li:activity:7531237862915346432/)
 
 A low-latency, cross-DEX **backrun-arbitrage searcher for Solana** — built and operated in
 **Rust**. It maintains a real-time, multi-DEX price graph, prices every route with
