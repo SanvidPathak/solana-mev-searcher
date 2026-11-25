@@ -1,0 +1,10 @@
+# Normalize line endings: store and check out text as LF on every platform
+* text=auto eol=lf
+
+# Binary assets — never line-ending converted
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.pdf  binary
