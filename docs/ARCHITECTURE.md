@@ -1,10 +1,10 @@
 # Architecture — Solana MEV Searcher
 
 High-level design (HLD) and low-level design (LLD) for a low-latency **Solana MEV /
-cross-DEX backrun-arbitrage** engine in **Rust**. The strategy core and all tuning parameters are
-**abstracted** on purpose (see [Abstraction boundary](#abstraction-boundary)); everything
-shown is the systems engineering that makes a competitive **Solana searcher** correct and
-fast.
+cross-DEX backrun-arbitrage** engine in **Rust**, routed **orderflow-auction-first**. The
+strategy core and all tuning parameters are **abstracted** on purpose (see
+[Abstraction boundary](#abstraction-boundary)); everything shown is the systems
+engineering that makes a competitive **Solana searcher** correct and fast.
 
 - [1. High-level design](#1-high-level-design)
 - [2. Low-level design](#2-low-level-design)
@@ -17,85 +17,77 @@ fast.
 
 ## 1. High-level design
 
-Six subsystems on one data path: market data in, verified opportunity out, every send
-gated by risk, every outcome measured and fed back.
+Six subsystems on one data path. The **primary route is orderflow-auction (OFA)**: an
+auction order triggers a priced, revert-protected backrun submitted as a **bid** (position
+won in the auction, latency-neutral). The **shred-reactive** route — detect from the raw
+feed, then **race to land** — is retained as **fallback**. Both share the same state
+engine, exact quoters, risk gates and measurement.
 
 ```mermaid
 flowchart TB
-  subgraph SRC["① Market Data"]
-    G["Geyser gRPC"]
-    W["WebSocket RPC<br/>failover"]
-    SH["Shred stream<br/>raw Turbine UDP"]
+  subgraph ORD["① Order &amp; Market Sources"]
+    OFA["Orderflow auction (OFA)<br/>batch-auction order intake"]
+    SH["Shred stream + Geyser / WSS<br/>raw Turbine · account state"]
   end
   subgraph ING["② Ingestion &amp; Live State"]
     FEC["Shred decoder<br/>Reed–Solomon FEC"]
-    MUX["Multiplexer<br/>dedup · order · coverage"]
+    MUX["Multiplexer<br/>dedup · per-account order · coverage"]
     PG["Price graph"]
     DS["Deep-state cache<br/>exact tick / bin arrays"]
   end
   subgraph DET["③ Opportunity Engine"]
-    PS["Pairwise scan"]
-    BF["Negative-cycle search"]
+    SRCH["Pair &amp; multi-hop search"]
     QQ["Exact quoters<br/>CLMM / DLMM"]
     SC{{"Strategy core<br/>(abstracted)"}}
+    BR["Revert-protected<br/>backrun build"]
   end
-  subgraph EXE["④ Execution &amp; Landing"]
-    TB["Tx builder<br/>legacy · v0+ALT · v1"]
-    SG["Simulation gate"]
-    CAP["Flashloan capital"]
-    LD["Multi-path landing"]
+  subgraph EXE["④ Execution"]
+    BID["OFA bid<br/>latency-neutral · position by auction"]
+    RACE["Race-land<br/>Jito · Sender · multi-region"]
   end
-  subgraph SAF["⑤ Risk &amp; Safety"]
-    CB["Breakers"]
-    PL["P&amp;L limits"]
-    KS["Kill switch"]
-  end
-  subgraph RSR["⑥ Measurement · offline"]
-    CEN["Census"]
-    RA["Race audit"]
-    LT["Shred-lead"]
-  end
+  CB["⑤ Risk &amp; safety<br/>breakers · P&amp;L limits · kill switch"]
+  MEAS["⑥ Measurement · offline<br/>census · race audit · shred-lead"]
 
-  G --> MUX
-  W --> MUX
-  SH --> FEC --> MUX
-  MUX --> PG --> DS
-  PG --> PS
-  PG --> BF
+  SH --> FEC --> MUX --> PG --> DS
+  PG --> SRCH
   DS --> QQ
-  PS --> SC
-  BF --> SC
+  SRCH --> SC
   QQ --> SC
-  SC -->|verified opportunity| TB
-  CAP --> TB
-  TB --> SG --> LD
-  SAF -. gates .-> EXE
-  EXE -. outcomes .-> SAF
-  EXE -. records .-> RSR
-  RSR -. calibrates .-> DET
+  SC --> BR
+
+  OFA ==>|primary| SRCH
+  BR ==>|primary| BID
+
+  SH -.->|fallback| SRCH
+  BR -.->|fallback| RACE
+
+  CB -. gates .-> EXE
+  EXE -. outcomes .-> CB
+  EXE -. records .-> MEAS
+  MEAS -. calibrates .-> DET
 
   classDef src fill:#e8eefc,stroke:#3b5bdb,color:#0b1b4d;
   classDef ing fill:#e7f5ff,stroke:#1c7ed6,color:#062a4d;
   classDef det fill:#e9f7ef,stroke:#2f9e44,color:#0b2e1a;
-  classDef exe fill:#fff4e6,stroke:#e8590c,color:#3d1a05;
-  classDef saf fill:#ffe9ec,stroke:#e03131,color:#4d0a12;
-  classDef rsr fill:#f1f3f5,stroke:#868e96,color:#212529;
+  classDef prim fill:#e6fcf5,stroke:#0ca678,color:#063b2e,stroke-width:2px;
+  classDef fb fill:#f1f3f5,stroke:#adb5bd,color:#495057;
   classDef abs fill:#f3f0ff,stroke:#7048e8,color:#1f1033;
-  class G,W,SH src;
+  classDef meta fill:#fff4e6,stroke:#e8590c,color:#3d1a05;
+  class OFA,BID prim;
+  class SH src;
   class FEC,MUX,PG,DS ing;
-  class PS,BF,QQ det;
+  class SRCH,QQ,BR det;
   class SC abs;
-  class TB,SG,CAP,LD exe;
-  class CB,PL,KS saf;
-  class CEN,RA,LT rsr;
+  class RACE fb;
+  class CB,MEAS meta;
 ```
 
 | # | Subsystem | Responsibility |
 |---|---|---|
-| ① | Market data | Redundant feeds: Geyser gRPC (primary), WebSocket RPC (failover), raw shreds (earliest possible sight of a block). |
+| ① | Order &amp; market sources | **Primary:** orderflow-auction (OFA) order intake. **Fallback trigger + shared state:** raw Turbine shreds, Geyser gRPC, WebSocket RPC. |
 | ② | Ingestion &amp; state | FEC recovery, dedup, strict per-account ordering, coverage/repair, into a concurrent price graph and an exact deep-state cache. |
-| ③ | Opportunity engine | Pairwise and multi-hop search over **exact** quotes; candidate scoring by the abstracted strategy core. |
-| ④ | Execution &amp; landing | Build → simulate → land, with flashloan capital and leader-aware multi-path submission. |
+| ③ | Opportunity engine | Pairwise and multi-hop search over **exact** quotes; candidate scoring by the abstracted strategy core; revert-protected backrun build. |
+| ④ | Execution | **Primary:** OFA bid — latency-neutral, position won in the auction. **Fallback:** race-land via Jito / Helius Sender / bundle proxies. |
 | ⑤ | Risk &amp; safety | Pre- and post-send gates: breakers, realized-P&amp;L limits, persisted kill switch. |
 | ⑥ | Measurement | Offline census, race/landing audits, and latency analysis that calibrate the engine. |
 
@@ -144,7 +136,7 @@ discards hopeless pairs before any exact quote, and only survivors reach the
 
 ```mermaid
 flowchart TB
-  IN["Changed pool / pair"] --> MEMO{Pair memo<br/>unchanged?}
+  IN["Trigger<br/>OFA order (primary) / shred event (fallback)"] --> MEMO{Pair memo<br/>unchanged?}
   MEMO -->|hit| RE["Re-emit last result"]
   MEMO -->|miss| SCR["Screen quote<br/>concave · per leg"]
   SCR --> PR{Prune<br/>hopeless?}
@@ -153,9 +145,9 @@ flowchart TB
   SZ --> EX["Exact deep quote<br/>DLMM bin-walk /<br/>Orca tick-array loop"]
   EX --> BUD{Account-key<br/>budget ≤ 64?}
   BUD -->|no| DROP
-  BUD -->|yes| NET["Net-SOL model<br/>fees · tip · flashloan · rent"]
+  BUD -->|yes| NET["Net-SOL model<br/>fees · tip/bid · flashloan · rent"]
   NET --> SC{{"Strategy scoring<br/>(abstracted)"}}
-  SC --> OPP["Verified opportunity"]
+  SC --> OPP["Verified opportunity<br/>revert-protected backrun"]
 
   subgraph T2["Multi-hop · timer"]
     BFS["Layered negative-cycle search<br/>from WSOL + anchors"]
@@ -179,7 +171,9 @@ building, so no work is wasted on a route that can't fit in one transaction.
 
 From verified opportunity to confirmed P&amp;L. Gated twice (once before building, once
 after simulation and before the irreversible send), landed by **signature**, and every
-outcome classified so the breakers and limits see the truth.
+outcome classified so the breakers and limits see the truth. The send is routed
+**primary-first**: an **OFA bid** (position won in the auction) with multi-region
+**race-landing** as fallback.
 
 ```mermaid
 flowchart TB
@@ -191,15 +185,22 @@ flowchart TB
   CU --> SIM{Simulate<br/>before submit?}
   SIM -->|fail| CL["Error classifier<br/>economic vs on-chain fault"]
   SIM -->|clean| G2{Gate again<br/>+ inflight slot + pause}
-  G2 -->|pass| FAN["Multi-region fan-out<br/>Jito · Sender · bundle proxies<br/>leader-aware routing"]
-  FAN --> CFM["Landing by signature<br/>confirmed on chain"]
+  G2 -->|pass| RT{Route}
+  RT ==>|primary| BID["OFA bid<br/>latency-neutral · position by auction"]
+  RT -.->|fallback| RACE["Race-land<br/>multi-region Jito · Sender · proxies"]
+  BID --> CFM["Landing by signature<br/>confirmed on chain"]
+  RACE --> CFM
   CFM --> PNL["Realized P&amp;L<br/>native + WSOL delta"]
   PNL --> LIM["P&amp;L limits · kill switch"]
   CL --> BRK["Circuit breakers"]
 
   classDef exe fill:#fff4e6,stroke:#e8590c,color:#3d1a05;
   classDef saf fill:#ffe9ec,stroke:#e03131,color:#4d0a12;
-  class VER,BLD,CU,FAN,CFM,PNL exe;
+  classDef prim fill:#e6fcf5,stroke:#0ca678,color:#063b2e,stroke-width:2px;
+  classDef fb fill:#f1f3f5,stroke:#adb5bd,color:#495057;
+  class VER,BLD,CU,CFM,PNL exe;
+  class BID prim;
+  class RACE fb;
   class CL,BRK,LIM saf;
 ```
 
@@ -218,10 +219,12 @@ Everything above is the *mechanism*. The *policy* — what makes it a strategy r
 plumbing demo — is intentionally not published:
 
 - the **strategy core** (how opportunities are scored, ranked, and selected),
-- **sizing, tip, timing, and risk parameters**,
+- **sizing, bid/tip, timing, and risk parameters**,
 - the **specific market structure edges** the engine targets,
 - keys, endpoints, and deployment configuration.
 
-The forward direction of this project is **orderflow-auction (OFA)** participation via
-latency-neutral **batch auctions**, which replaces the open-market speed race with a
-bid — a design choice, documented here at the architecture level only.
+The **primary route is orderflow-auction (OFA)** participation via latency-neutral
+**batch auctions** — position won by a bid, not by the open-market speed race — with
+shred-reactive racing retained as fallback. The engine is built around this route and
+**ready to integrate with an auction**; it is documented here at the architecture level
+only, and runs record-only until a pre-registered metric passes.

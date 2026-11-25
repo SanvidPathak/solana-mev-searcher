@@ -2,15 +2,16 @@
 
 ![Rust](https://img.shields.io/badge/Rust-2021-orange)
 ![Solana](https://img.shields.io/badge/Solana-mainnet-14F195)
+![Routing](https://img.shields.io/badge/routing-OFA--first-0ca678)
 ![Strategy](https://img.shields.io/badge/backrun--only-no%20sandwiching-blue)
-![Hot path](https://img.shields.io/badge/hot%20path-sub--slot-success)
 ![Status](https://img.shields.io/badge/status-research-lightgrey)
 
 A low-latency, cross-DEX **backrun-arbitrage searcher for Solana** — built and operated in
 **Rust**. It maintains a real-time, multi-DEX price graph, prices every route with
 **exact, on-chain-equivalent CLMM/DLMM quoters**, and lands **revert-protected** backruns
-through a hardened, fail-closed execution pipeline (**Jito bundles**, **Helius Sender**,
-flashloan-funded). **Backrun-only by design: no front-running, no sandwiching.**
+**orderflow-auction (OFA) first** — position won by a bid, not by the speed race — with
+multi-region racing (**Jito bundles**, **Helius Sender**, flashloan-funded) retained as
+fallback. **Backrun-only by design: no front-running, no sandwiching.**
 
 This repository is the **public architecture overview** of the system — it shows the
 systems engineering, while the strategy core and all tuning parameters are
@@ -26,16 +27,19 @@ detection** (Kamino klend + Scope, MarginFi), record-only.
 
 ## Architecture
 
-Six subsystems, from market data to confirmed P&L — the strategy core is abstracted on
-purpose. The full **low-level design** (ingestion, detection and execution internals)
-lives in **[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
+Six subsystems, from order intake to confirmed P&L. The **primary route is
+orderflow-auction (OFA)**: an auction order triggers a priced, revert-protected backrun
+submitted as a **bid** (position won in the auction, latency-neutral). The
+**shred-reactive** route — detect from the raw feed, then **race to land** — is retained as
+**fallback**. The strategy core is abstracted on purpose; the full **low-level design**
+(ingestion, detection and execution internals) lives in
+**[`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md)**.
 
 ```mermaid
 flowchart TB
-  subgraph SRC["① Market Data"]
-    G["Geyser gRPC<br/>accounts · slots · tx"]
-    W["WebSocket RPC<br/>failover"]
-    SH["Shred stream<br/>raw Turbine UDP"]
+  subgraph ORD["① Order &amp; Market Sources"]
+    OFA["Orderflow auction (OFA)<br/>batch-auction order intake"]
+    SH["Shred stream + Geyser / WSS<br/>raw Turbine · account state"]
   end
   subgraph ING["② Ingestion &amp; Live State"]
     FEC["Shred decoder<br/>Reed–Solomon FEC"]
@@ -44,61 +48,55 @@ flowchart TB
     DS["Deep-state cache<br/>exact tick / bin arrays"]
   end
   subgraph DET["③ Opportunity Engine"]
-    PS["Pairwise scan<br/>convex size search"]
-    BF["Negative-cycle search<br/>multi-hop routes"]
+    SRCH["Pair &amp; multi-hop search"]
     QQ["Exact quoters<br/>CLMM / DLMM, on-chain-equivalent"]
     SC{{"Strategy core<br/>(abstracted)"}}
+    BR["Revert-protected<br/>backrun build"]
   end
-  subgraph EXE["④ Execution &amp; Landing"]
-    TB["Tx builder<br/>legacy · v0+ALT · v1"]
-    SG["Simulation gate<br/>CU sizing"]
-    CAP["Flashloan capital<br/>Kamino · MarginFi"]
-    LD["Multi-path landing<br/>Jito · Sender · bundles"]
+  subgraph EXE["④ Execution"]
+    BID["OFA bid<br/>latency-neutral · position by auction"]
+    RACE["Race-land<br/>Jito · Sender · multi-region"]
   end
-  subgraph SAF["⑤ Risk &amp; Safety"]
-    CB["Circuit breakers"]
-    PL["Realized-P&amp;L limits"]
-    KS["Kill switch"]
-  end
-  subgraph RSR["⑥ Measurement · offline"]
-    CEN["Market census"]
-    RA["Race / landing audit"]
-    LT["Latency &amp; shred-lead"]
-  end
+  CB["⑤ Risk &amp; safety<br/>breakers · P&amp;L limits · kill switch"]
+  MEAS["⑥ Measurement · offline<br/>census · race audit · shred-lead"]
 
-  G --> MUX
-  W --> MUX
-  SH --> FEC --> MUX
-  MUX --> PG --> DS
-  PG --> PS
-  PG --> BF
+  SH --> FEC --> MUX --> PG --> DS
+  PG --> SRCH
   DS --> QQ
-  PS --> SC
-  BF --> SC
+  SRCH --> SC
   QQ --> SC
-  SC -->|verified opportunity| TB
-  CAP --> TB
-  TB --> SG --> LD
-  SAF -. gates .-> EXE
-  EXE -. outcomes .-> SAF
-  EXE -. records .-> RSR
-  RSR -. calibrates .-> DET
+  SC --> BR
+
+  OFA ==>|primary| SRCH
+  BR ==>|primary| BID
+
+  SH -.->|fallback| SRCH
+  BR -.->|fallback| RACE
+
+  CB -. gates .-> EXE
+  EXE -. outcomes .-> CB
+  EXE -. records .-> MEAS
+  MEAS -. calibrates .-> DET
 
   classDef src fill:#e8eefc,stroke:#3b5bdb,color:#0b1b4d;
   classDef ing fill:#e7f5ff,stroke:#1c7ed6,color:#062a4d;
   classDef det fill:#e9f7ef,stroke:#2f9e44,color:#0b2e1a;
-  classDef exe fill:#fff4e6,stroke:#e8590c,color:#3d1a05;
-  classDef saf fill:#ffe9ec,stroke:#e03131,color:#4d0a12;
-  classDef rsr fill:#f1f3f5,stroke:#868e96,color:#212529;
+  classDef prim fill:#e6fcf5,stroke:#0ca678,color:#063b2e,stroke-width:2px;
+  classDef fb fill:#f1f3f5,stroke:#adb5bd,color:#495057;
   classDef abs fill:#f3f0ff,stroke:#7048e8,color:#1f1033;
-  class G,W,SH src;
+  classDef meta fill:#fff4e6,stroke:#e8590c,color:#3d1a05;
+  class OFA,BID prim;
+  class SH src;
   class FEC,MUX,PG,DS ing;
-  class PS,BF,QQ det;
+  class SRCH,QQ,BR det;
   class SC abs;
-  class TB,SG,CAP,LD exe;
-  class CB,PL,KS saf;
-  class CEN,RA,LT rsr;
+  class RACE fb;
+  class CB,MEAS meta;
 ```
+
+> **Primary route: orderflow-auction (OFA)** — a backrun submitted as a bid, where position
+> is won in the auction rather than the 26–67 ms open-market speed race. Shred-reactive
+> racing is kept as the fallback. The engine is built around the OFA route.
 
 ## On-chain correctness
 
@@ -136,9 +134,10 @@ flowchart TB
 
 | Layer | Integrations |
 |---|---|
+| Order flow | **Orderflow auction (OFA) batch-auction intake — primary route**; shred-reactive detection as fallback |
 | DEX venues | Raydium AMM v4, Orca Whirlpool (CLMM), Meteora DLMM, Pump / PumpSwap |
 | Market data | Geyser gRPC, WebSocket RPC (failover), raw Turbine shred stream, Helius |
-| Landing | Jito bundles (multi-region), Helius Sender, bundle proxies |
+| Landing | **OFA bid (primary)**; multi-region race-land — Jito bundles, Helius Sender, bundle proxies — as fallback |
 | Capital | Kamino flashloans, MarginFi flashloans |
 | Lending / liquidations | Kamino klend + Scope, MarginFi (detection, record-only) |
 | Transactions | Legacy, v0 + Address Lookup Tables, v1 (SIMD-0385) |
@@ -149,7 +148,7 @@ This is an architecture overview, not an alpha drop. The omissions below are **i
 abstraction**, not gaps:
 
 - the **opportunity scoring and route-selection logic** (the "strategy core"),
-- all **thresholds, sizing, tip, and timing parameters**,
+- all **thresholds, sizing, bid/tip, and timing parameters**,
 - the **specific market-structure edges** the searcher targets,
 - private keys, endpoints, and operational configuration.
 
@@ -158,12 +157,13 @@ transaction encoding, and landing** — and those are what this repository docum
 
 ## Status
 
-Independent research and engineering project. _Source is private; a scoped technical
-walkthrough is available to partners under NDA._ No profit, revenue, or landing-rate
-figures are claimed here — performance claims are intentionally out of scope.
+Independent research and engineering project, **built orderflow-auction-first**. _Source is
+private; a scoped technical walkthrough is available to partners under NDA._ No profit,
+revenue, or landing-rate figures are claimed here — performance claims are intentionally
+out of scope.
 
 ---
 
-<sub>**Topics:** solana · mev · mev-bot · mev-searcher · arbitrage · backrun · defi ·
-jito · rust · dex · amm · clmm · dlmm · flashloan · orderflow-auction ·
+<sub>**Topics:** solana · mev · mev-bot · mev-searcher · arbitrage · backrun ·
+orderflow-auction · ofa · defi · jito · rust · dex · amm · clmm · dlmm · flashloan ·
 trading-infrastructure · low-latency · raydium · orca · meteora</sub>
